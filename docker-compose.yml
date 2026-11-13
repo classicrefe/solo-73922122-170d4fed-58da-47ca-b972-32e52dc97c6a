@@ -23,6 +23,8 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # The offline merge page is served by both apps on their own ports:
+  #   http://localhost:8000/offline   http://localhost:8001/offline
   web-b:
     build: .
     image: bom-warehouse:latest

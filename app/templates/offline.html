@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>离线 BOM 合并 · BOM 叶件用量数仓</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>离线 BOM 合并</h1>
+    <p class="sub">下载完整父子用量 CSV · 离线修订 · 三方比较后合并且物化用量</p>
+  </div>
+  <div class="badges">
+    <span class="badge">进程 <b id="badge-instance">{{ instance }}</b></span>
+    <span class="badge">当前版本 <b id="badge-version">-</b></span>
+    <span class="badge" id="badge-status">就绪</span>
+  </div>
+</header>
+
+<main class="single">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>① 下载基准</h2>
+      <div class="hint">
+        下载包含 <span class="mono">parent,child,qty</span> 的完整文件；服务端同时保存一份
+        <b>不可变基准</b>并返回修订单 ID。离线修改后，删除某行即代表删除该关系。
+      </div>
+    </div>
+    <div class="form-row">
+      <button class="primary" id="btn-download-base">下载完整 CSV（生成修订单）</button>
+      <span class="hint" id="base-info">尚未下载</span>
+    </div>
+    <div class="form-row">
+      <label>修订单 ID <input id="f-revision" placeholder="下载后自动填入" autocomplete="off"></label>
+      <label>修订后的 CSV <input id="f-file" type="file" accept=".csv,text/csv"></label>
+      <button class="primary" id="btn-preview">预览三方合并</button>
+      <button class="ghost" id="btn-refresh-version">检查当前库版本</button>
+    </div>
+    <div id="alert" class="alert hidden"></div>
+    <div id="cycle" class="cycle hidden"></div>
+    <div id="stale" class="cycle hidden"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>② 三方比较</h2>
+      <span class="hint" id="preview-meta">尚未预览</span>
+    </div>
+    <div class="summary" id="preview-summary"></div>
+    <div class="hint" id="preview-note">
+      基准 = 下载时的结构，上传 = 离线修订稿，当前 = 现在的库。仅一侧变化采用变化；
+      双方改成相同值则合并；双方不同则逐项选择当前或上传（删除也参与比较）。
+    </div>
+    <div class="table-wrap tall">
+      <table>
+        <thead>
+          <tr><th>父件</th><th>子件</th><th>基准</th><th>上传</th><th>当前</th><th>采用</th><th>结果</th></tr>
+        </thead>
+        <tbody id="changes-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>③ 冲突逐项选择</h2>
+      <div class="hint">未解决冲突时不得应用；选择后请重新预览以冻结新的最终结构。</div>
+    </div>
+    <div id="conflicts-wrap" class="hidden">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>父件</th><th>子件</th><th>基准</th><th>上传</th><th>当前</th><th>选择</th></tr>
+          </thead>
+          <tbody id="conflicts-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="form-row">
+      <button class="primary" id="btn-resolve" disabled>按选择重新预览</button>
+      <button class="primary" id="btn-apply" disabled>确认应用合并</button>
+      <span class="hint" id="apply-note">预览并解决冲突后可应用</span>
+    </div>
+    <div class="hint">
+      成功时父子结构与物化叶件用量一起生效；失败或成环则整批不改、保留旧版。
+      预览后若当前库又有提交，旧确认会被拒绝并要求重新预览。
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span><a class="link" href="/">返回编辑页</a> · 合并与预览均不持有写锁，原编辑照常可用。</span>
+</footer>
+
+<script src="/static/offline.js"></script>
+</body>
+</html>

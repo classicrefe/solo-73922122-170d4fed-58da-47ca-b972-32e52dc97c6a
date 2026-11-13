@@ -31,6 +31,26 @@ def test_template_ids_cover_all_script_references(tmp_path):
     assert not missing, f"script references ids absent from the template: {sorted(missing)}"
 
 
+def test_offline_page_ids_cover_script_references(tmp_path):
+    store = BomStore(str(tmp_path / "offline-ui.db"))
+    app = create_app(store, instance="ui", demo_mode=True, seed_demo=False)
+    with TestClient(app) as client:
+        page = client.get("/offline")
+        script = client.get("/static/offline.js").text
+        index = client.get("/").text
+    assert page.status_code == 200
+    assert "离线 BOM 合并" in page.text
+    html_ids = _ids(page.text)
+    referenced = set(re.findall(r'$\("([^"]+)"\)', script))
+    missing = referenced - html_ids
+    assert not missing, f"offline script references ids absent from template: {sorted(missing)}"
+    # The editor page links to the offline merge page.
+    assert 'href="/offline"' in index
+    # Key controls exist for download / upload / conflicts / apply.
+    for control in ("btn-download-base", "f-file", "btn-preview", "btn-apply", "conflicts-body"):
+        assert f'id="{control}"' in page.text
+
+
 def test_sample_data_renders_correct_usage(tmp_path):
     """The bundled sample numbers in the README/UI match real expansion."""
     from app.demo import DEMO_EDGES, PROMOTE_LEAF_OPS

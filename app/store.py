@@ -35,13 +35,31 @@ web processes from serialising behind one stale plan.
 Version-based storage also makes reads and downloads trivially consistent:
 the API resolves the head once inside a single read transaction and only
 selects already-materialised rows, so a response never mixes two commits.
+
+Offline revisions and three-way merge
+    ``offline_revision``  immutable snapshot (CSV) of the structure at the
+                          moment the complete parent/child/qty file was
+                          downloaded; it is the merge *base*.
+    ``merge_preview``     frozen three-way comparison plus the resolved final
+                          structure, and the published version it was
+                          previewed against.  Applying requires every conflict
+                          to be resolved and the published version to be
+                          unchanged, otherwise the confirmation is rejected
+                          (the user must preview again) so newer edits are
+                          never overwritten.  The final structure is written
+                          with edges + materialised usage in one transaction,
+                          after the usual in-memory cycle check; a cycle
+                          rejects the whole batch.
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import os
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -61,6 +79,10 @@ class BomError(Exception):
 
     status_code = 400
 
+    def __init__(self, message: str, **extra: Any):
+        super().__init__(message)
+        self.extra: dict[str, Any] = extra
+
 
 class ValidationError(BomError):
     status_code = 422
@@ -76,6 +98,29 @@ class CapacityError(BomError):
 
 class ConflictError(BomError):
     status_code = 409
+
+
+class StalePreviewError(ConflictError):
+    """The database changed after a merge preview: the confirmation is void."""
+
+    def __init__(self, current_version: int, preview_version: int):
+        self.current_version = current_version
+        self.preview_version = preview_version
+        super().__init__(
+            f"预览后当前库已更新为 v{current_version}（预览基于 v{preview_version}），"
+            "旧确认已拒绝，请重新预览后再应用",
+            current_version=current_version,
+            preview_version=preview_version,
+        )
+
+
+class UnresolvedConflictError(ConflictError):
+    def __init__(self, conflicts: list[dict[str, Any]]):
+        self.conflicts = conflicts
+        super().__init__(
+            f"仍有 {len(conflicts)} 项冲突未解决，整批不得应用",
+            conflicts=conflicts,
+        )
 
 
 class CyclicStructureError(BomError):
@@ -353,6 +398,208 @@ def _edge_signature(edges: Iterable[Edge]) -> tuple[tuple[str, str, int], ...]:
 
 
 # --------------------------------------------------------------------------
+# Offline revision CSV + three-way merge (pure helpers)
+# --------------------------------------------------------------------------
+
+OFFLINE_CSV_COLUMNS = ("parent", "child", "qty")
+MAX_OFFLINE_CSV_BYTES = 5 * 1024 * 1024
+OFFLINE_KEEP_REVISIONS = 200
+OFFLINE_KEEP_PREVIEWS = 100
+
+
+def edges_csv(edges: Sequence[Edge]) -> str:
+    """Complete ``parent,child,qty`` CSV used as the offline editing file."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(OFFLINE_CSV_COLUMNS)
+    for edge in sorted(edges, key=lambda e: (e.parent, e.child)):
+        writer.writerow([edge.parent, edge.child, edge.qty])
+    return buffer.getvalue()
+
+
+def parse_edges_csv(text: str) -> list[Edge]:
+    """Parse a complete CSV. Missing rows mean deletion (whole-file replace)."""
+    if not isinstance(text, str):
+        raise ValidationError("CSV 内容必须是文本")
+    if len(text.encode("utf-8")) > MAX_OFFLINE_CSV_BYTES:
+        raise ValidationError("CSV 文件过大（上限 5 MB）")
+    text = text.lstrip("﻿")
+    if not text.strip():
+        raise ValidationError("CSV 为空；完整文件至少需要表头 parent,child,qty")
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration:  # pragma: no cover - guarded by the empty check
+        raise ValidationError("CSV 为空") from None
+    names = [cell.strip().lower() for cell in header]
+    for column in OFFLINE_CSV_COLUMNS:
+        if column not in names:
+            raise ValidationError(f"CSV 缺少列 {column}（需要 parent,child,qty 表头）")
+    if len(set(names)) != len(names):
+        raise ValidationError("CSV 表头存在重复列")
+    index = {name: names.index(name) for name in OFFLINE_CSV_COLUMNS}
+    edges: dict[tuple[str, str], Edge] = {}
+    for line_no, row in enumerate(reader, start=2):
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        if len(row) < len(names):
+            row = row + [""] * (len(names) - len(row))
+        parent = _normalise_token(row[index["parent"]], f"第 {line_no} 行 parent")
+        child = _normalise_token(row[index["child"]], f"第 {line_no} 行 child")
+        qty = _normalise_qty(row[index["qty"]])
+        key = (parent, child)
+        if key in edges:
+            raise ValidationError(f"第 {line_no} 行父子关系 {parent} → {child} 重复出现")
+        edges[key] = Edge(parent, child, qty)
+    return sorted(edges.values(), key=lambda e: (e.parent, e.child))
+
+
+@dataclass(frozen=True)
+class MergeChange:
+    """One parent/child relation compared across base, upload and current."""
+
+    parent: str
+    child: str
+    base: int | None
+    upload: int | None
+    current: int | None
+    decision: str  # merged | upload | current | conflict
+    result: int | None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.parent, self.child)
+
+    @property
+    def kind(self) -> str:
+        if self.decision == "conflict":
+            return "conflict"
+        if self.base is None and self.result is not None:
+            return "added"
+        if self.base is not None and self.result is None:
+            return "deleted"
+        if self.decision == "merged":
+            return "merged"
+        return "changed"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "parent": self.parent,
+            "child": self.child,
+            "base": self.base,
+            "upload": self.upload,
+            "current": self.current,
+            "decision": self.decision,
+            "result": self.result,
+            "kind": self.kind,
+        }
+
+
+def _edge_map(edges: Iterable[Edge]) -> dict[tuple[str, str], int]:
+    return {edge.key: edge.qty for edge in edges}
+
+
+def three_way_merge(
+    base: Iterable[Edge], upload: Iterable[Edge], current: Iterable[Edge]
+) -> tuple[list[MergeChange], list[MergeChange]]:
+    """Compare by parent/child relation.
+
+    * only one side changed  -> take that side
+    * both sides agree       -> merged value
+    * both changed differently (including delete vs value) -> conflict
+
+    Rows identical on all three sides produce no entry.  ``base`` is the
+    immutable offline revision snapshot, ``upload`` the edited complete CSV
+    and ``current`` the published structure when the merge is previewed.
+    """
+    base_map = _edge_map(base)
+    upload_map = _edge_map(upload)
+    current_map = _edge_map(current)
+    keys = sorted(set(base_map) | set(upload_map) | set(current_map))
+    changes: list[MergeChange] = []
+    conflicts: list[MergeChange] = []
+    for key in keys:
+        before = base_map.get(key)
+        edited = upload_map.get(key)
+        now = current_map.get(key)
+        if edited == now:
+            decision, result = "merged", edited
+        elif edited == before:
+            decision, result = "current", now
+        elif now == before:
+            decision, result = "upload", edited
+        else:
+            decision, result = "conflict", None
+        if decision == "conflict":
+            conflicts.append(MergeChange(key[0], key[1], before, edited, now, decision, None))
+        elif edited != before or now != before:
+            changes.append(MergeChange(key[0], key[1], before, edited, now, decision, result))
+    return changes, conflicts
+
+
+def parse_resolutions(payload: Any) -> dict[tuple[str, str], str]:
+    """Parse ``[{"parent","child","choice":"current"|"upload"}]``."""
+    if payload is None:
+        return {}
+    if not isinstance(payload, list):
+        raise ValidationError("resolutions 必须是数组")
+    parsed: dict[tuple[str, str], str] = {}
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, Mapping):
+            raise ValidationError(f"第 {index} 条冲突选择必须是对象")
+        parent = _normalise_token(item.get("parent"), f"第 {index} 条 parent")
+        child = _normalise_token(item.get("child"), f"第 {index} 条 child")
+        choice = item.get("choice")
+        if choice not in ("current", "upload"):
+            raise ValidationError(f"第 {index} 条 choice 必须是 current 或 upload")
+        key = (parent, child)
+        if key in parsed:
+            raise ValidationError(f"冲突 {parent} → {child} 被选择了两次")
+        parsed[key] = choice
+    return parsed
+
+
+def resolve_merge(
+    base: Iterable[Edge],
+    upload: Iterable[Edge],
+    current: Iterable[Edge],
+    resolutions: Mapping[tuple[str, str], str],
+    *,
+    allow_unresolved: bool = False,
+) -> tuple[list[Edge], list[MergeChange], list[MergeChange]]:
+    """Build the final structure; refuse when any conflict is unresolved.
+
+    ``allow_unresolved`` is for *previewing*: unresolved rows keep their
+    current value so the comparison can be shown, but the preview is not
+    applicable.  Applying always requires every conflict to be resolved.
+    Resolutions for rows that are no longer conflicting (for example after
+    the library changed) are ignored, so a re-preview never dead-ends.
+    """
+    changes, conflicts = three_way_merge(base, upload, current)
+    unresolved = [item.as_dict() for item in conflicts if item.key not in resolutions]
+    if unresolved and not allow_unresolved:
+        raise UnresolvedConflictError(unresolved)
+
+    final: dict[tuple[str, str], Edge] = {edge.key: edge for edge in current}
+    for change in changes:
+        if change.result is None:
+            final.pop(change.key, None)
+        else:
+            final[change.key] = Edge(change.parent, change.child, change.result)
+    for conflict in conflicts:
+        choice = resolutions.get(conflict.key)
+        if choice is None:  # preview only: leave the current value in place
+            continue
+        value = conflict.current if choice == "current" else conflict.upload
+        if value is None:
+            final.pop(conflict.key, None)
+        else:
+            final[conflict.key] = Edge(conflict.parent, conflict.child, value)
+    final_edges = sorted(final.values(), key=lambda e: (e.parent, e.child))
+    return final_edges, changes, conflicts
+
+
+# --------------------------------------------------------------------------
 # Store
 # --------------------------------------------------------------------------
 
@@ -408,6 +655,26 @@ class BomStore:
         finally:
             conn.close()
 
+    @contextmanager
+    def writer(self) -> Iterator[sqlite3.Connection]:
+        """Short write transaction (``BEGIN IMMEDIATE``).
+
+        Only used for small bookkeeping writes (offline revisions, preview
+        bookkeeping); never held while expanding or comparing structures.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
     def _init_schema(self) -> None:
         conn = self._connect()
         try:
@@ -445,6 +712,35 @@ class BomStore:
                     id          INTEGER PRIMARY KEY CHECK (id = 1),
                     version_seq INTEGER NOT NULL REFERENCES bom_version(seq),
                     updated_at  TEXT NOT NULL
+                );
+
+                -- Immutable offline-edit bases.  Created when the complete
+                -- parent/child/qty CSV is downloaded; never updated.
+                CREATE TABLE IF NOT EXISTS offline_revision (
+                    revision_id TEXT PRIMARY KEY,
+                    version_seq INTEGER NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    edge_count  INTEGER NOT NULL,
+                    checksum    TEXT NOT NULL,
+                    csv         TEXT NOT NULL
+                );
+
+                -- Frozen three-way comparison + resolved final structure.
+                -- Applying it is only allowed while the published version is
+                -- still ``current_version`` (otherwise: stale preview).
+                CREATE TABLE IF NOT EXISTS merge_preview (
+                    preview_id      TEXT PRIMARY KEY,
+                    revision_id     TEXT NOT NULL,
+                    base_version    INTEGER NOT NULL,
+                    current_version INTEGER NOT NULL,
+                    created_at      TEXT NOT NULL,
+                    resolved        INTEGER NOT NULL,
+                    changes         TEXT NOT NULL,
+                    conflicts       TEXT NOT NULL,
+                    resolutions     TEXT NOT NULL,
+                    final_edges     TEXT NOT NULL,
+                    applied_version INTEGER,
+                    applied_at      TEXT
                 );
                 """
             )
@@ -763,6 +1059,346 @@ class BomStore:
         ops = [BatchOp("upsert", upserts=(edge,)) for edge in edges]
         self.commit_batch(ops)
         return True
+
+    # -- offline revisions + three-way merge -------------------------------
+
+    def create_offline_revision(self) -> dict[str, Any]:
+        """Snapshot the published structure as an immutable download base.
+
+        The base is read under one read snapshot and written in a separate
+        short transaction.  If a commit lands in between, the recorded
+        version is the one actually snapshotted, not a newer head - callers
+        can still compare it with the current head and notice the difference.
+        """
+        revision_id = secrets.token_urlsafe(12)
+        with self.reader() as conn:
+            head = self._head(conn)
+            version_seq = int(head["version_seq"])
+            edges = self._load_edges(conn, version_seq)
+            created_at = _now()
+            body = edges_csv(edges)
+        with self.writer() as conn:
+            conn.execute(
+                "INSERT INTO offline_revision "
+                "(revision_id, version_seq, created_at, edge_count, checksum, csv) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (revision_id, version_seq, created_at, len(edges),
+                 hashlib.sha256(body.encode("utf-8")).hexdigest(), body),
+            )
+            # Keep the bookkeeping bounded; never prune a revision that still
+            # has an unapplied preview.
+            conn.execute(
+                """
+                DELETE FROM offline_revision
+                WHERE revision_id NOT IN (
+                    SELECT revision_id FROM offline_revision
+                    ORDER BY created_at DESC, rowid DESC LIMIT ?
+                )
+                AND revision_id NOT IN (
+                    SELECT revision_id FROM merge_preview WHERE applied_version IS NULL
+                )
+                """,
+                (OFFLINE_KEEP_REVISIONS,),
+            )
+        return {
+            "revision_id": revision_id,
+            "version_seq": version_seq,
+            "created_at": created_at,
+            "edge_count": len(edges),
+            "csv": body,
+        }
+
+    def get_offline_revision(self, revision_id: str) -> dict[str, Any]:
+        with self.reader() as conn:
+            row = conn.execute(
+                "SELECT * FROM offline_revision WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"修订单 {revision_id} 不存在")
+        return dict(row)
+
+    def offline_revision_csv(self, revision_id: str) -> tuple[str, dict[str, Any]]:
+        row = self.get_offline_revision(revision_id)
+        return row["csv"], row
+
+    def list_offline_revisions(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.reader() as conn:
+            rows = conn.execute(
+                "SELECT revision_id, version_seq, created_at, edge_count, checksum "
+                "FROM offline_revision ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _load_current_edges(self, conn: sqlite3.Connection) -> tuple[int, list[Edge]]:
+        head = self._head(conn)
+        return int(head["version_seq"]), self._load_edges(conn, head["version_seq"])
+
+    def preview_merge(
+        self,
+        revision_id: str,
+        upload: Sequence[Edge],
+        resolutions: Mapping[tuple[str, str], str] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze a three-way comparison against the current structure.
+
+        This takes only a read snapshot (no write lock; expansion is not run
+        here) and stores the frozen comparison so that applying it can later
+        be rejected if the published version moved on.  All conflicts must be
+        resolved for the preview to be applicable.
+        """
+        resolutions = dict(resolutions or {})
+        revision = self.get_offline_revision(revision_id)
+        base_edges = parse_edges_csv(revision["csv"])
+        with self.reader() as conn:
+            current_version, current_edges = self._load_current_edges(conn)
+            final_edges, changes, conflicts = resolve_merge(
+                base_edges, upload, current_edges, resolutions, allow_unresolved=True
+            )
+            validate_limits(final_edges)
+            cycles = find_cycles(final_edges)
+            if cycles:
+                raise CyclicStructureError(cycles)
+            resolved = all(item.key in resolutions for item in conflicts)
+            preview_id = secrets.token_urlsafe(12)
+            payload = {
+                "preview_id": preview_id,
+                "revision_id": revision_id,
+                "base_version": revision["version_seq"],
+                "current_version": current_version,
+                "resolved": resolved,
+                "applicable": resolved,
+                "changes": [item.as_dict() for item in changes],
+                "conflicts": [item.as_dict() for item in conflicts],
+                "final_edges": [e.as_dict() for e in final_edges],
+                "counts": _merge_counts(changes, conflicts, final_edges),
+            }
+        # Bookkeeping write outside the read snapshot (short BEGIN IMMEDIATE).
+        with self.writer() as conn:
+            conn.execute(
+                "INSERT INTO merge_preview (preview_id, revision_id, base_version, "
+                "current_version, created_at, resolved, changes, conflicts, resolutions, "
+                "final_edges) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    preview_id,
+                    revision_id,
+                    revision["version_seq"],
+                    current_version,
+                    _now(),
+                    1 if resolved else 0,
+                    json.dumps(payload["changes"], ensure_ascii=False),
+                    json.dumps(payload["conflicts"], ensure_ascii=False),
+                    json.dumps(
+                        [{"parent": p, "child": c, "choice": choice}
+                         for (p, c), choice in sorted(resolutions.items())],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(payload["final_edges"], ensure_ascii=False),
+                ),
+            )
+            # Bounded bookkeeping; applied previews are kept (they are the
+            # audit trail of what was applied) while old unapplied ones are
+            # dropped together with their revision.
+            conn.execute(
+                """
+                DELETE FROM merge_preview
+                WHERE preview_id IN (
+                    SELECT preview_id FROM merge_preview
+                    WHERE applied_version IS NULL
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (OFFLINE_KEEP_PREVIEWS,),
+            )
+            conn.execute(
+                """
+                DELETE FROM offline_revision
+                WHERE revision_id NOT IN (
+                    SELECT revision_id FROM merge_preview WHERE applied_version IS NULL
+                )
+                  AND revision_id NOT IN (
+                      SELECT revision_id FROM offline_revision
+                      ORDER BY created_at DESC, rowid DESC LIMIT ?
+                  )
+                """,
+                (OFFLINE_KEEP_REVISIONS,),
+            )
+        return payload
+
+    def get_merge_preview(self, preview_id: str) -> dict[str, Any]:
+        with self.reader() as conn:
+            row = conn.execute(
+                "SELECT * FROM merge_preview WHERE preview_id = ?", (preview_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"合并预览 {preview_id} 不存在")
+        return self._preview_payload(row)
+
+    @staticmethod
+    def _preview_payload(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+        changes = json.loads(data["changes"])
+        conflicts = json.loads(data["conflicts"])
+        final_edges = json.loads(data["final_edges"])
+        return {
+            "preview_id": data["preview_id"],
+            "revision_id": data["revision_id"],
+            "base_version": data["base_version"],
+            "current_version": data["current_version"],
+            "created_at": data["created_at"],
+            "resolved": bool(data["resolved"]),
+            "applicable": bool(data["resolved"]) and data["applied_version"] is None,
+            "applied_version": data["applied_version"],
+            "applied_at": data["applied_at"],
+            "changes": changes,
+            "conflicts": conflicts,
+            "final_edges": final_edges,
+            "counts": _merge_counts(
+                [_change_obj(item) for item in changes],
+                [_change_obj(item) for item in conflicts],
+                [Edge(e["parent"], e["child"], e["qty"]) for e in final_edges],
+            ),
+        }
+
+    def apply_merge(
+        self,
+        preview_id: str,
+        pause_hook: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Apply a confirmed preview: structure + materialised usage together.
+
+        Strict concurrency rule: the preview is only applied while the
+        published version is exactly the one it was previewed against.  If any
+        commit landed in between, the confirmation is rejected
+        (``StalePreviewError``) and the user must preview again - the newer
+        edit is never overwritten.  The check and the write happen under the
+        same ``BEGIN IMMEDIATE``/CAS, so the window cannot be reopened.
+
+        Expansion runs outside the write lock (``pause_hook`` lets tests and
+        the demo hold that window open), so ordinary edits stay available.
+        """
+        preview = self.get_merge_preview(preview_id)
+        if preview["applied_version"] is not None:
+            raise ConflictError(
+                f"该预览已应用于 v{preview['applied_version']}，不能重复应用"
+            )
+        if not preview["resolved"]:
+            raise UnresolvedConflictError(preview["conflicts"])
+        final_edges = [
+            Edge(item["parent"], item["child"], int(item["qty"]))
+            for item in preview["final_edges"]
+        ]
+        expected = int(preview["current_version"])
+        current = self.published_version()
+        if current != expected:
+            raise StalePreviewError(current, expected)
+        result = self._commit_exact(final_edges, expected, pause_hook)
+        with self.writer() as conn:
+            conn.execute(
+                "UPDATE merge_preview SET applied_version = ?, applied_at = ? "
+                "WHERE preview_id = ?",
+                (result.version_id, _now(), preview_id),
+            )
+        return {
+            **self.get_merge_preview(preview_id),
+            "version_id": result.version_id,
+            "version_seq": result.version_seq,
+            "retries": 0,
+            "leaf_rows": result.leaf_rows,
+            "reused": result.reused,
+        }
+
+    def _commit_exact(
+        self,
+        edges: Sequence[Edge],
+        expected_seq: int,
+        pause_hook: Callable[[int, int], None] | None = None,
+    ) -> CommitResult:
+        """Publish exactly ``edges`` iff ``expected_seq`` is still published.
+
+        Same atomic shape as an ordinary batch (cycle check, expansion outside
+        the write lock, then one ``BEGIN IMMEDIATE`` writing edges + usage +
+        head), but with a strict CAS: no re-planning, so a concurrent commit
+        causes rejection instead of being overwritten.
+        """
+        ordered = sorted(edges, key=lambda e: (e.parent, e.child))
+        validate_limits(ordered)
+        cycles = find_cycles(ordered)
+        if cycles:
+            raise CyclicStructureError(cycles)
+        if pause_hook is not None:
+            pause_hook(0, expected_seq)
+        try:
+            usage = self.expand_all(ordered)
+        except OverflowError as exc:
+            raise ValidationError(f"用量溢出：{exc}") from None
+        conn = self._connect()
+        try:
+            if not self._claim_writer(conn, expected_seq):
+                current = self.published_version()
+                raise StalePreviewError(current, expected_seq)
+            head = self._head(conn)
+            current_edges = self._load_edges(conn, expected_seq)
+            if _edge_signature(ordered) == _edge_signature(current_edges):
+                conn.execute("COMMIT")
+                return CommitResult(
+                    expected_seq, expected_seq, head["created_at"], True, 0, 0
+                )
+            new_seq = self._insert_version(conn, ordered)
+            conn.executemany(
+                "INSERT INTO bom_edge (version_seq, parent, child, qty) VALUES (?, ?, ?, ?)",
+                [(new_seq, e.parent, e.child, e.qty) for e in ordered],
+            )
+            conn.executemany(
+                "INSERT INTO leaf_usage (version_seq, top_part, leaf_part, qty) VALUES (?, ?, ?, ?)",
+                [(new_seq, top, leaf, qty) for (top, leaf), qty in sorted(usage.items())],
+            )
+            conn.execute(
+                "UPDATE bom_head SET version_seq = ?, updated_at = ? WHERE id = 1",
+                (new_seq, _now()),
+            )
+            self._prune(conn, new_seq)
+            created_row = conn.execute(
+                "SELECT created_at FROM bom_version WHERE seq = ?", (new_seq,)
+            ).fetchone()
+            conn.execute("COMMIT")
+            return CommitResult(
+                new_seq, new_seq, created_row["created_at"], False, 0, len(usage)
+            )
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def published_version(self) -> int:
+        with self.reader() as conn:
+            return int(self._head(conn)["version_seq"])
+
+
+def _change_obj(item: Mapping[str, Any]) -> MergeChange:
+    return MergeChange(
+        item["parent"], item["child"], item["base"], item["upload"], item["current"],
+        item["decision"], item["result"],
+    )
+
+
+def _merge_counts(
+    changes: Sequence[MergeChange],
+    conflicts: Sequence[MergeChange],
+    final_edges: Sequence[Edge],
+) -> dict[str, int]:
+    counts = {"changed": 0, "added": 0, "deleted": 0, "merged": 0, "conflict": len(conflicts)}
+    for change in changes:
+        if change.kind in counts:
+            counts[change.kind] += 1
+    counts["final_edges"] = len(final_edges)
+    counts["final_parts"] = len(set(parts_from_edges(final_edges)))
+    return counts
 
 
 def _now() -> str:

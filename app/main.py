@@ -6,6 +6,9 @@ several independent web processes against the same SQLite file.
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -15,16 +18,19 @@ from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-
 from .demo import DEMO_EDGES, INTERLEAVE_A, INTERLEAVE_B, PROMOTE_LEAF_OPS
 from .store import (
     MAX_EDGES,
+    MAX_OFFLINE_CSV_BYTES as MAX_UPLOAD_BYTES,
     MAX_PARTS,
     BomError,
     BomStore,
     CommitResult,
     NotFoundError,
+    ValidationError,
+    parse_edges_csv,
     parse_ops,
+    parse_resolutions,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +69,7 @@ def create_app(
         paths = getattr(exc, "paths", None)
         if paths:
             payload["paths"] = paths
+        payload.update(getattr(exc, "extra", {}) or {})
         return JSONResponse(status_code=exc.status_code, content=payload)
 
     def state_payload() -> dict[str, Any]:
@@ -109,6 +116,11 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(request, "index.html", {"instance": active_instance, "demo_mode": demo_enabled})
+
+    @app.get("/offline", response_class=HTMLResponse)
+    def offline_page(request: Request) -> HTMLResponse:
+        """Offline BOM revision merge page (download/upload/conflicts/apply)."""
+        return templates.TemplateResponse(request, "offline.html", {"instance": active_instance})
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -178,6 +190,134 @@ def create_app(
                 for top, count in sorted(by_top.items())
             ],
         }
+
+    # -- offline merge -----------------------------------------------------
+
+    @app.get("/api/offline/revisions/{revision_id}.csv")
+    def download_offline_revision(revision_id: str) -> Response:
+        body, revision = active_store.offline_revision_csv(revision_id)
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="bom_structure_{revision_id}.csv"'
+                ),
+                "X-Bom-Revision": revision_id,
+                "X-Bom-Version": str(revision["version_seq"]),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.get("/api/offline/revisions/{revision_id}")
+    def get_offline_revision(revision_id: str) -> dict[str, Any]:
+        revision = active_store.get_offline_revision(revision_id)
+        return {
+            "revision_id": revision["revision_id"],
+            "version_seq": revision["version_seq"],
+            "created_at": revision["created_at"],
+            "edge_count": revision["edge_count"],
+            "checksum": revision["checksum"],
+            "current_version": active_store.published_version(),
+        }
+
+    @app.post("/api/offline/revisions")
+    def create_offline_revision() -> Response:
+        """Download the complete parent/child/qty CSV as an immutable base.
+
+        The server keeps an immutable snapshot of the published structure and
+        returns its revision id in the response headers (and in the CSV's
+        filename) so the edited file can be uploaded against that base.
+        """
+        revision = active_store.create_offline_revision()
+        filename = f"bom_structure_{revision['revision_id']}.csv"
+        return Response(
+            content=revision["csv"],
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Bom-Revision": revision["revision_id"],
+                "X-Bom-Version": str(revision["version_seq"]),
+                "X-Bom-Edges": str(revision["edge_count"]),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.get("/api/offline/revisions")
+    def offline_revisions() -> dict[str, Any]:
+        """Current version plus the recent immutable bases (newest first)."""
+        return {
+            "current_version": active_store.published_version(),
+            "revisions": active_store.list_offline_revisions(),
+        }
+
+    @app.post("/api/offline/preview")
+    async def offline_preview(request: Request) -> dict[str, Any]:
+        """Three-way compare base vs uploaded CSV vs current library.
+
+        Does not write anything to the structure and runs without a write
+        lock, so ordinary edits stay available.  ``resolutions`` (form field
+        with JSON, or JSON body) re-previews choices for conflicts.
+        """
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file")
+            if upload is None or isinstance(upload, str):
+                raise ValidationError("缺少上传文件字段 file")
+            data = await upload.read()
+            if isinstance(data, bytes) and len(data) > MAX_UPLOAD_BYTES:
+                raise ValidationError("CSV 文件过大（上限 5 MB）")
+            try:
+                raw = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise ValidationError("CSV 必须是 UTF-8 编码") from None
+            revision_id = str(form.get("revision_id") or "").strip()
+            resolutions_raw: Any = form.get("resolutions") or None
+        else:
+            body = await request.body()
+            try:
+                payload = json.loads(body) if body else {}
+            except ValueError:
+                raise ValidationError("请求体必须是 JSON 或 multipart/form-data") from None
+            if not isinstance(payload, dict):
+                raise ValidationError("请求体必须是对象")
+            revision_id = str(payload.get("revision_id") or "").strip()
+            resolutions_raw = payload.get("resolutions")
+            if isinstance(payload.get("csv"), str):
+                raw = payload["csv"]
+            elif isinstance(payload.get("rows"), list):
+                buffer = io.StringIO()
+                writer = csv.writer(buffer, lineterminator="\n")
+                writer.writerow(["parent", "child", "qty"])
+                for row in payload["rows"]:
+                    if not isinstance(row, dict):
+                        raise ValidationError("rows 的每一项必须是对象")
+                    writer.writerow([row.get("parent"), row.get("child"), row.get("qty")])
+                raw = buffer.getvalue()
+            else:
+                raise ValidationError("缺少 CSV 内容（csv 或 rows 字段）")
+        if not revision_id:
+            raise ValidationError("缺少修订单 revision_id")
+        uploaded = parse_edges_csv(raw)
+        if isinstance(resolutions_raw, str):
+            try:
+                resolutions_raw = json.loads(resolutions_raw)
+            except ValueError:
+                raise ValidationError("resolutions 必须是 JSON") from None
+        resolutions = parse_resolutions(resolutions_raw)
+        return active_store.preview_merge(revision_id, uploaded, resolutions)
+
+    @app.get("/api/offline/preview/{preview_id}")
+    def get_offline_preview(preview_id: str) -> dict[str, Any]:
+        return active_store.get_merge_preview(preview_id)
+
+    @app.post("/api/offline/apply/{preview_id}")
+    def apply_offline_merge(preview_id: str, request: Request) -> dict[str, Any]:
+        """Apply a previewed merge; stale confirmations are rejected with 409."""
+        return active_store.apply_merge(
+            preview_id, pause_hook=pause_hook_from(request)
+        )
 
     @app.post("/api/demo/seed")
     def seed_demo_endpoint() -> dict[str, Any]:
